@@ -201,6 +201,28 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
+    def test_disables_sdk_retries_for_api_key(self):
+        """#26293: the SDK's default max_retries=2 ignores Retry-After and
+        double-retries inside hermes's outer loop. We delegate retry entirely
+        to the outer loop, so the client must be built with max_retries=0."""
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-api03-something")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["max_retries"] == 0
+
+    def test_disables_sdk_retries_for_oauth_token(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-oat01-" + "x" * 60)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["max_retries"] == 0
+
+    def test_bedrock_disables_sdk_retries(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            mock_sdk.AnthropicBedrock = MagicMock()
+            build_anthropic_bedrock_client("us-east-1")
+            kwargs = mock_sdk.AnthropicBedrock.call_args[1]
+            assert kwargs["max_retries"] == 0
+
 
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)
@@ -1001,6 +1023,72 @@ class TestConvertMessages:
         assert assistant_blocks[0]["type"] == "text"
         assert assistant_blocks[0]["text"] == "Hello from assistant"
         assert assistant_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_assistant_tool_use_cache_control_is_preserved(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Run the tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "test_tool", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+        ], native_anthropic=True)
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_msg = [m for m in result if m["role"] == "assistant"][0]
+        tool_use = assistant_msg["content"][-1]
+
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["id"] == "tc_1"
+        assert tool_use["cache_control"] == {"type": "ephemeral"}
+
+    def test_ordered_replay_tool_use_cache_control_is_preserved(self):
+        messages = apply_anthropic_cache_control([
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Run the tool"},
+            {
+                "role": "assistant",
+                "content": "",
+                "anthropic_content_blocks": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Need a tool.",
+                        "signature": "sig_1",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tc_1",
+                        "name": "test_tool",
+                        "input": {"query": "raw"},
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "tc_1",
+                        "function": {
+                            "name": "test_tool",
+                            "arguments": '{"query":"redacted"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "result"},
+        ], native_anthropic=True)
+
+        _, result = convert_messages_to_anthropic(messages)
+        assistant_msg = [m for m in result if m["role"] == "assistant"][0]
+        thinking, tool_use = assistant_msg["content"]
+
+        assert thinking["type"] == "thinking"
+        assert "cache_control" not in thinking
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["id"] == "tc_1"
+        assert tool_use["input"] == {"query": "redacted"}
+        assert tool_use["cache_control"] == {"type": "ephemeral"}
 
     def test_tool_cache_control_is_preserved_on_tool_result_block(self):
         messages = apply_anthropic_cache_control([

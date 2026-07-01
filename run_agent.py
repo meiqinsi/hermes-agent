@@ -213,6 +213,28 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
+# Internal flags that mark a message as ephemeral empty-response/prefill
+# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
+# injected after an empty response, the terminal "(empty)" sentinel, and the
+# thinking-only prefill placeholder. These exist only to drive the next API
+# retry; the in-memory loop pops them before appending the real response.
+# Persistence must mirror that, otherwise an append-only flush can commit them
+# to the session store and a resumed session replays synthetic "(empty)"/nudge
+# turns as if they were genuine context.
+_EPHEMERAL_SCAFFOLDING_FLAGS = (
+    "_empty_recovery_synthetic",
+    "_empty_terminal_sentinel",
+    "_thinking_prefill",
+)
+
+
+def _is_ephemeral_scaffolding(msg: Any) -> bool:
+    """Return True when ``msg`` is internal recovery scaffolding that must never
+    be persisted to the durable transcript (SQLite session store or JSON log)."""
+    return isinstance(msg, dict) and any(
+        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+    )
+
 
 _MAX_TOOL_WORKERS = 8
 
@@ -290,6 +312,31 @@ def _qwen_portal_headers() -> dict:
         "X-DashScope-UserAgent": _ua,
         "X-DashScope-AuthType": "qwen-oauth",
     }
+
+
+def _safe_session_filename_component(session_id: str) -> str:
+    """Return a stable, path-safe filename component for a session ID.
+
+    Session IDs can originate from untrusted input (e.g. the
+    ``X-Hermes-Session-Id`` API header) and are otherwise interpolated raw
+    into on-disk artifact filenames under ``~/.hermes/sessions/``.  Without
+    sanitization, a traversal-shaped ID such as ``../../../../etc/pwned``
+    would let a caller write the session snapshot / request dump outside the
+    sessions directory.  This collapses every non ``[A-Za-z0-9_-]`` character
+    to ``_`` (so no path separators or ``.`` survive), caps the length, and —
+    when sanitization changed the string — appends a short content hash so two
+    distinct IDs that sanitize to the same component don't collide.  The
+    result is always a single, traversal-free path segment.
+    """
+    raw = str(session_id or "").strip()
+    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
+    sanitized = sanitized[:96] or "session"
+    if raw and sanitized == raw:
+        return sanitized
+    digest = hashlib.sha256(
+        raw.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:12]
+    return f"{sanitized}_{digest}"
 
 
 class _StreamErrorEvent(Exception):
@@ -666,6 +713,24 @@ class AIAgent:
             carry_over_context=carry_over_context,
             reset_engine=True,
         )
+
+        # Reset-only session switches (/new, /resume, /branch) update
+        # agent.session_id before calling reset_session_state(). The built-in
+        # compressor keeps durable cooldown state keyed by its bound session,
+        # so rebind it when the active session changed but no full start hook ran.
+        engine = getattr(self, "context_compressor", None)
+        target_session_id = getattr(self, "session_id", "") or ""
+        bound_session_id = getattr(engine, "_session_id", "") if engine is not None else ""
+        if (
+            engine is not None
+            and hasattr(engine, "bind_session_state")
+            and target_session_id
+            and target_session_id != bound_session_id
+        ):
+            try:
+                engine.bind_session_state(getattr(self, "_session_db", None), target_session_id)
+            except Exception as exc:
+                logger.debug("context engine bind_session_state during reset: %s", exc)
 
     def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
         """
@@ -1090,7 +1155,9 @@ class AIAgent:
             hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
                 getattr(self, "_base_url_lower", "")
             )
-        return hostname == "api.githubcopilot.com"
+        if not hostname:
+            return False
+        return hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com")
 
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
@@ -1269,6 +1336,11 @@ class AIAgent:
         # completions endpoint; its /v1/responses endpoint returns 404.
         if normalized_provider == "nous":
             return False
+        if normalized_provider == "custom":
+            # Generic custom endpoints are conservative by default. They may
+            # relay GPT-5 models without full Responses semantics, so only
+            # direct OpenAI/xAI URL detection should auto-upgrade them.
+            return False
         if normalized_provider == "copilot":
             try:
                 from hermes_cli.models import _should_use_copilot_responses_api
@@ -1424,10 +1496,13 @@ class AIAgent:
         user_message: str,
         assistant_content: str,
         messages: List[Dict[str, Any]],
+        require_workspace: bool = True,
     ) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.looks_like_codex_intermediate_ack``."""
         from agent.agent_runtime_helpers import looks_like_codex_intermediate_ack
-        return looks_like_codex_intermediate_ack(self, user_message, assistant_content, messages)
+        return looks_like_codex_intermediate_ack(
+            self, user_message, assistant_content, messages, require_workspace
+        )
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_reasoning``."""
@@ -1477,13 +1552,18 @@ class AIAgent:
         keep working.
         """
         from agent.background_review import spawn_background_review_thread
+        from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
         )
-        t = threading.Thread(target=target, daemon=True, name="bg-review")
+        # Carry the active profile into the review thread so MEMORY.md / skill
+        # review writes land in the right profile (#54937).
+        t = threading.Thread(
+            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
+        )
         t.start()
 
     def _build_memory_write_metadata(
@@ -1647,6 +1727,17 @@ class AIAgent:
 
             for msg in messages:
                 if not isinstance(msg, dict):
+                    continue
+                # Never write ephemeral recovery scaffolding to the session
+                # store. The flush is append-only (it only advances
+                # _last_flushed_db_idx via identity tracking), so a synthetic
+                # message committed by a mid-turn persist cannot be un-written
+                # when the end-of-turn drop removes it from the in-memory list —
+                # the resumed transcript would then replay synthetic
+                # "(empty)"/nudge/thinking-prefill turns as if they were genuine
+                # context. Skip regardless of position: an answered nudge leaves
+                # the synthetic pair buried mid-list, not just at the tail.
+                if _is_ephemeral_scaffolding(msg):
                     continue
                 msg_id = id(msg)
                 if msg_id in flushed_ids:
@@ -1949,6 +2040,29 @@ class AIAgent:
                 prefix = f"HTTP {status_code}: " if status_code else ""
                 msg = AIAgent._coerce_api_error_detail(msg)
                 return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+
+        # SDK may leave body empty while httpx still has the payload (#36109).
+        # Redact before returning: the raw provider/proxy error body is
+        # attacker-influenced and may echo Authorization / x-api-key / request
+        # JSON, which would otherwise leak into final_response + logs (this path
+        # widens exposure vs the old empty-body "HTTP 400" string).
+        response = getattr(error, "response", None)
+        if response is not None:
+            snippet = (getattr(response, "text", None) or "").strip()
+            if snippet:
+                status_code = getattr(error, "status_code", None)
+                prefix = f"HTTP {status_code}: " if status_code else ""
+                try:
+                    payload = json.loads(snippet)
+                except (json.JSONDecodeError, TypeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    err = payload.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        return redact_sensitive_text(f"{prefix}{str(err['message'])[:300]}")
+                    if payload.get("message"):
+                        return redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}")
+                return redact_sensitive_text(f"{prefix}{snippet[:300]}")
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
@@ -2336,15 +2450,23 @@ class AIAgent:
 
         # Re-derive the target path each call so /branch and /compress
         # session-id changes land in the right file without any re-point
-        # bookkeeping at the call sites.
+        # bookkeeping at the call sites.  Sanitize the session ID into a
+        # single traversal-free path segment — session IDs can come from
+        # untrusted input (X-Hermes-Session-Id header) and must not escape
+        # the sessions directory.
         try:
-            log_file = self.logs_dir / f"session_{self.session_id}.json"
+            safe_sid = _safe_session_filename_component(self.session_id)
+            log_file = self.logs_dir / f"session_{safe_sid}.json"
         except Exception:
             return
 
         try:
             cleaned = []
             for msg in messages:
+                # Mirror the SQLite flush: ephemeral recovery scaffolding is
+                # internal retry state, never durable transcript content.
+                if _is_ephemeral_scaffolding(msg):
+                    continue
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
@@ -3303,13 +3425,36 @@ class AIAgent:
         The gateway creates a fresh AIAgent per message, so the in-memory
         TodoStore is empty. We scan the history for the most recent todo
         tool response and replay it to reconstruct the state.
+
+        Hydration is restricted to tool results that are paired with an
+        earlier assistant ``todo`` tool call. The gateway/API server accepts
+        caller-supplied ``conversation_history``, so a forged bare
+        ``role: tool`` message carrying a ``todos`` array must not be able to
+        seed the store without a matching canonical tool call
+        (GHSA-5g4g-6jrg-mw3g).
         """
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
         # Walk history backwards to find the most recent todo tool response
         last_todo_response = None
-        for msg in reversed(history):
+        for idx in range(len(history) - 1, -1, -1):
+            msg = history[idx]
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            # Only accept tool results paired with a prior assistant todo call.
+            if not self._tool_response_matches_todo_call(history, idx):
+                continue
+            if len(content) > MAX_TODO_RESULT_CHARS:
+                logger.warning(
+                    "Skipping oversized todo tool response during hydration: "
+                    "session=%s chars=%d",
+                    self.session_id or "none",
+                    len(content),
+                )
+                continue
             # Quick check: todo responses contain "todos" key
             if '"todos"' not in content:
                 continue
@@ -3320,13 +3465,60 @@ class AIAgent:
                     break
             except (json.JSONDecodeError, TypeError):
                 continue
-        
+
         if last_todo_response:
             # Replay the items into the store (replace mode)
             self._todo_store.write(last_todo_response, merge=False)
             if not self.quiet_mode:
                 self._vprint(f"{self.log_prefix}📋 Restored {len(last_todo_response)} todo item(s) from history")
         _set_interrupt(False)
+
+    @classmethod
+    def _tool_response_matches_todo_call(
+        cls,
+        history: List[Dict[str, Any]],
+        tool_index: int,
+    ) -> bool:
+        """Return True when a tool result belongs to a prior assistant todo call.
+
+        Scans backwards from the tool result to the nearest assistant message
+        and confirms it issued a ``todo`` tool call whose id matches this
+        result's ``tool_call_id``. A ``user``/``system`` boundary (or a missing
+        id) means the result is unpaired and must not hydrate the store.
+        """
+        if tool_index < 0 or tool_index >= len(history):
+            return False
+        tool_msg = history[tool_index]
+        tool_call_id = tool_msg.get("tool_call_id")
+        if not tool_call_id:
+            return False
+
+        for prior_idx in range(tool_index - 1, -1, -1):
+            prior = history[prior_idx]
+            role = prior.get("role")
+            if role == "assistant":
+                return cls._assistant_has_todo_tool_call(prior, tool_call_id)
+            if role in {"user", "system"}:
+                return False
+        return False
+
+    @classmethod
+    def _assistant_has_todo_tool_call(
+        cls,
+        assistant_msg: Dict[str, Any],
+        tool_call_id: str,
+    ) -> bool:
+        """True when the assistant message issued a ``todo`` call with this id."""
+        tool_calls = assistant_msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return False
+
+        for tool_call in tool_calls:
+            if cls._get_tool_call_id_static(tool_call) != tool_call_id:
+                continue
+            if cls._get_tool_call_name_static(tool_call) == "todo":
+                return True
+        return False
 
     @property
     def is_interrupted(self) -> bool:
@@ -3356,8 +3548,8 @@ class AIAgent:
     def _get_tool_call_id_static(tc) -> str:
         """Extract call ID from a tool_call entry (dict or object)."""
         if isinstance(tc, dict):
-            return tc.get("call_id", "") or tc.get("id", "") or ""
-        return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
+            return (tc.get("call_id", "") or tc.get("id", "") or "").strip()
+        return (getattr(tc, "call_id", "") or getattr(tc, "id", "") or "").strip()
 
     @staticmethod
     def _get_tool_call_name_static(tc) -> str:
@@ -3682,16 +3874,28 @@ class AIAgent:
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):
                 return client
+            old_client = client
+            try:
+                new_client = self._create_openai_client(
+                    self._client_kwargs, reason=reason, shared=True
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to recreate closed OpenAI client (%s) %s error=%s",
+                    reason,
+                    self._client_log_context(),
+                    exc,
+                )
+                raise RuntimeError("Failed to recreate closed OpenAI client") from exc
+            self.client = new_client
 
         logger.warning(
-            "Detected closed shared OpenAI client; recreating before use (%s) %s",
+            "Detected closed shared OpenAI client; recreated before use (%s) %s",
             reason,
             self._client_log_context(),
         )
-        if not self._replace_primary_openai_client(reason=f"recreate_closed:{reason}"):
-            raise RuntimeError("Failed to recreate closed OpenAI client")
-        with self._openai_client_lock():
-            return self.client
+        self._close_openai_client(old_client, reason=f"replace:{reason}", shared=True)
+        return new_client
 
     def _cleanup_dead_connections(self) -> bool:
         """Forwarder — see ``agent.agent_runtime_helpers.cleanup_dead_connections``."""
@@ -3752,7 +3956,7 @@ class AIAgent:
         # unaffected (they don't go through here).
         request_kwargs["max_retries"] = 0
         if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "api.githubcopilot.com")
+            base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
@@ -4014,7 +4218,7 @@ class AIAgent:
             self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
-        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
+        elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
@@ -4391,9 +4595,19 @@ class AIAgent:
                 return True
         return False
 
+    # 20 MB base64 ≈ 15 MB decoded image — generous but prevents OOM from an
+    # oversized data: URL (a 100 MB+ payload creates ~275 MB of memory pressure,
+    # and gateway users sharing the same process can trivially OOM it).
+    _MAX_DATA_URL_BASE64_BYTES = 20 * 1024 * 1024
+
     @staticmethod
     def _materialize_data_url_for_vision(image_url: str) -> tuple[str, Optional[Path]]:
         header, _, data = str(image_url or "").partition(",")
+        if len(data) > AIAgent._MAX_DATA_URL_BASE64_BYTES:
+            logger.warning(
+                "data-URL payload too large (%d bytes), skipping", len(data)
+            )
+            return "", None
         mime = "image/jpeg"
         if header.startswith("data:"):
             mime_part = header[len("data:"):].split(";", 1)[0].strip()
@@ -4900,7 +5114,7 @@ class AIAgent:
             return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
-            or base_url_host_matches(self._base_url_lower, "api.githubcopilot.com")
+            or base_url_host_matches(self._base_url_lower, "githubcopilot.com")
         ):
             try:
                 from hermes_cli.models import github_model_reasoning_efforts
