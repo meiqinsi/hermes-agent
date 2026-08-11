@@ -3637,6 +3637,8 @@ class APIServerAdapter(BasePlatformAdapter):
         "origin_session_id",
         "parent_session_id",
         "session_key",
+        "delivery_state",
+        "delivered_at",
     )
 
     @classmethod
@@ -3671,6 +3673,9 @@ class APIServerAdapter(BasePlatformAdapter):
           recently completed records retained by the registry.
         - ``active_only`` (bool): when present, overrides ``include_recent``.
           Default behavior is active-only.
+
+        Response also includes ``pending_delivery_count`` and ``drain_complete``
+        so orchestrators can wait for wake delivery after subagents finish.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -3689,24 +3694,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 request.query.get("active_only"), default=True
             )
 
-        from tools.async_delegation import list_async_delegations_for_session
+        from tools.async_delegation import snapshot_session_delegations
 
-        # active_count always reflects live work for this session so clients
-        # polling with include_recent=1 still get a reliable "work remaining"
-        # signal without inventing a second endpoint.
-        active_items = list_async_delegations_for_session(
-            session_id, active_only=True
-        )
-        items = (
-            active_items
-            if active_only
-            else list_async_delegations_for_session(session_id, active_only=False)
-        )
+        snapshot = snapshot_session_delegations(session_id, active_only=active_only)
         return web.json_response({
             "object": "hermes.session.delegations",
             "session_id": session_id,
-            "active_count": len(active_items),
-            "delegations": [self._project_delegation_for_api(item) for item in items],
+            "active_count": snapshot["active_count"],
+            "pending_delivery_count": snapshot["pending_delivery_count"],
+            "drain_complete": snapshot["drain_complete"],
+            "delegations": [
+                self._project_delegation_for_api(item)
+                for item in snapshot["delegations"]
+            ],
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":

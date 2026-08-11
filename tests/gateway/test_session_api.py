@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -9,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
+from tools.process_registry import process_registry
 
 
 @pytest.fixture
@@ -31,7 +33,9 @@ def adapter(session_db):
 
 @pytest.fixture
 def auth_adapter(session_db):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-test"}))
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "sk-test-81754-long-key"})
+    )
     adapter._session_db = session_db
     return adapter
 
@@ -756,7 +760,9 @@ async def test_session_delegations_lists_active_for_origin_session(
 
         app = _create_session_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            missing = await cli.get("/api/sessions/does-not-exist/delegations")
+            missing = await cli.get(
+                f"/api/sessions/missing-deleg-{uuid.uuid4().hex}/delegations"
+            )
             assert missing.status == 404
 
             resp = await cli.get(f"/api/sessions/{session_id}/delegations")
@@ -772,6 +778,8 @@ async def test_session_delegations_lists_active_for_origin_session(
         assert payload["object"] == "hermes.session.delegations"
         assert payload["session_id"] == session_id
         assert payload["active_count"] == 1
+        assert payload["pending_delivery_count"] == 0
+        assert payload["drain_complete"] is False
         assert len(payload["delegations"]) == 1
         row = payload["delegations"][0]
         assert row["delegation_id"] == res["delegation_id"]
@@ -796,6 +804,86 @@ async def test_session_delegations_lists_active_for_origin_session(
 
 
 @pytest.mark.asyncio
+async def test_session_delegations_pending_delivery_blocks_drain_complete(
+    adapter, session_db, monkeypatch,
+):
+    """Completed subagent with undelivered wake must not report drain_complete."""
+    import time
+
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 60.0)
+    ad._reset_for_tests()
+    session_id = session_db.create_session("deleg-drain-session", "api_server")
+
+    res = ad.dispatch_async_delegation(
+        goal="fast bg",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="run_key",
+        origin_session_id=session_id,
+        max_async_children=1,
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+    assert res["status"] == "dispatched"
+
+    deadline = time.monotonic() + 5.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    evt = None
+    while time.monotonic() < deadline:
+        if not process_registry.completion_queue.empty():
+            evt = process_registry.completion_queue.get_nowait()
+            if evt.get("delegation_id") == res["delegation_id"]:
+                break
+        time.sleep(0.02)
+    assert evt is not None
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/delegations")
+        payload = await resp.json()
+        recent = await cli.get(
+            f"/api/sessions/{session_id}/delegations?include_recent=1"
+        )
+        recent_payload = await recent.json()
+
+    assert payload["active_count"] == 0
+    assert payload["pending_delivery_count"] == 1
+    assert payload["drain_complete"] is False
+    assert recent_payload["active_count"] == 0
+    assert recent_payload["pending_delivery_count"] == 1
+    row = next(
+        d for d in recent_payload["delegations"]
+        if d["delegation_id"] == res["delegation_id"]
+    )
+    assert row["status"] == "completed"
+    assert row["delivery_state"] == "pending"
+    assert "delivered_at" not in row
+
+    assert ad.mark_completion_delivered(res["delegation_id"])
+
+    async with TestClient(TestServer(app)) as cli:
+        done = await cli.get(f"/api/sessions/{session_id}/delegations")
+        done_payload = await done.json()
+        done_recent = await cli.get(
+            f"/api/sessions/{session_id}/delegations?include_recent=1"
+        )
+        done_recent_payload = await done_recent.json()
+
+    assert done_payload["pending_delivery_count"] == 0
+    assert done_payload["drain_complete"] is True
+    delivered_row = next(
+        d for d in done_recent_payload["delegations"]
+        if d["delegation_id"] == res["delegation_id"]
+    )
+    assert delivered_row["delivery_state"] == "delivered"
+    assert isinstance(delivered_row["delivered_at"], float)
+
+
+@pytest.mark.asyncio
 async def test_session_delegations_requires_auth(auth_adapter, session_db):
     session_id = session_db.create_session("deleg-auth-session", "api_server")
     app = _create_session_app(auth_adapter)
@@ -804,9 +892,11 @@ async def test_session_delegations_requires_auth(auth_adapter, session_db):
         assert unauth.status == 401
         ok = await cli.get(
             f"/api/sessions/{session_id}/delegations",
-            headers={"Authorization": "Bearer sk-test"},
+            headers={"Authorization": "Bearer sk-test-81754-long-key"},
         )
         assert ok.status == 200
         payload = await ok.json()
         assert payload["active_count"] == 0
+        assert payload["pending_delivery_count"] == 0
+        assert payload["drain_complete"] is True
         assert payload["delegations"] == []

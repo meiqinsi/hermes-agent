@@ -1538,6 +1538,131 @@ def list_async_delegations_for_session(
     return out
 
 
+def _delegation_matches_session_id(
+    session_id: str,
+    *,
+    origin_session_id: str = "",
+    session_key: str = "",
+    parent_session_id: Optional[str] = None,
+) -> bool:
+    """True when a delegation row belongs to ``session_id`` (#81754 matching)."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return False
+    return (
+        str(origin_session_id or "") == sid
+        or str(session_key or "") == sid
+        or str(parent_session_id or "") == sid
+    )
+
+
+def count_pending_deliveries_for_session(session_id: str) -> int:
+    """Count terminal delegations whose wake completion is not yet delivered.
+
+    Rows stay ``delivery_state='pending'`` from batch/subagent completion until
+    the gateway injects the wake turn and acknowledges delivery. External
+    orchestrators use this with ``active_count`` to avoid treating the session
+    as fully drained while a parent wake turn is still in flight.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return 0
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running', 'finalizing')
+                 AND delivery_state = 'pending'
+                 AND (origin_session_id = ? OR origin_session = ? OR parent_session_id = ?)""",
+            (sid, sid, sid),
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def list_durable_delegations_for_session(session_id: str) -> List[Dict[str, Any]]:
+    """Read-only snapshot of durable async_delegations rows for one session."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, origin_session_id, parent_session_id,
+                      state, dispatched_at, completed_at, delivery_state, delivered_at, task_json
+               FROM async_delegations
+               WHERE origin_session_id = ? OR origin_session = ? OR parent_session_id = ?
+               ORDER BY dispatched_at ASC, delegation_id ASC""",
+            (sid, sid, sid),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        task = json.loads(row[9] or "{}") if row[9] else {}
+        item: Dict[str, Any] = {
+            "delegation_id": row[0],
+            "session_key": row[1] or "",
+            "origin_session_id": row[2] or "",
+            "parent_session_id": row[3],
+            "status": row[4],
+            "dispatched_at": row[5],
+            "completed_at": row[6],
+            "delivery_state": row[7],
+            "delivered_at": row[8],
+        }
+        for key in ("goal", "goals", "role", "model", "toolsets", "is_batch"):
+            if key in task:
+                item[key] = task[key]
+        out.append(item)
+    return out
+
+
+def snapshot_session_delegations(
+    session_id: str,
+    *,
+    active_only: bool = True,
+) -> Dict[str, Any]:
+    """Merged in-memory registry + durable delivery state for the Sessions API."""
+    active_items = list_async_delegations_for_session(session_id, active_only=True)
+    memory_items = (
+        active_items
+        if active_only
+        else list_async_delegations_for_session(session_id, active_only=False)
+    )
+    durable_by_id = {
+        row["delegation_id"]: row
+        for row in list_durable_delegations_for_session(session_id)
+    }
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in memory_items:
+        delegation_id = item.get("delegation_id")
+        if not delegation_id:
+            continue
+        merged[delegation_id] = dict(item)
+        durable = durable_by_id.get(delegation_id)
+        if durable is not None:
+            merged[delegation_id]["delivery_state"] = durable.get("delivery_state")
+            if durable.get("delivered_at") is not None:
+                merged[delegation_id]["delivered_at"] = durable.get("delivered_at")
+
+    if not active_only:
+        for delegation_id, durable in durable_by_id.items():
+            if delegation_id in merged:
+                continue
+            if durable.get("status") in _LIVE_STATUSES:
+                continue
+            merged[delegation_id] = dict(durable)
+
+    delegations = sorted(
+        merged.values(),
+        key=lambda row: (row.get("dispatched_at") or 0, row.get("delegation_id") or ""),
+    )
+    pending_delivery_count = count_pending_deliveries_for_session(session_id)
+    active_count = len(active_items)
+    return {
+        "active_count": active_count,
+        "pending_delivery_count": pending_delivery_count,
+        "drain_complete": active_count == 0 and pending_delivery_count == 0,
+        "delegations": delegations,
+    }
+
+
 def interrupt_all(reason: str = "shutdown") -> int:
     """Signal every running async delegation to stop. Returns how many.
 

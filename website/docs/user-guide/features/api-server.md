@@ -485,6 +485,8 @@ curl http://localhost:8642/api/sessions/$ID/delegations \
   "object": "hermes.session.delegations",
   "session_id": "my-session",
   "active_count": 1,
+  "pending_delivery_count": 0,
+  "drain_complete": false,
   "delegations": [
     {
       "delegation_id": "deleg_...",
@@ -499,15 +501,30 @@ curl http://localhost:8642/api/sessions/$ID/delegations \
 
 Defaults to **active-only** (`running` / `stalling` / `finalizing`). Pass
 `?include_recent=1` (or `?active_only=false`) to also include recently
-completed records retained by the registry. `active_count` always reflects
-live work for the session, even when recent completions are included.
+completed records retained by the registry or durable store. `active_count`
+always reflects live work for the session, even when recent completions are
+included.
+
+**Delivery drain fields** (for external orchestrators such as SCLAW):
+
+| Field | Meaning |
+|-------|---------|
+| `active_count` | Live subagent/batch units still running in the registry |
+| `pending_delivery_count` | Terminal delegations whose wake completion is not yet `delivered` |
+| `drain_complete` | `active_count == 0` and `pending_delivery_count == 0` |
+| `delivery_state` | Per delegation: `pending`, `delivered`, or `dropped` (when included) |
+| `delivered_at` | Timestamp when wake injection completed (when `delivered`) |
+
+A subagent can finish (`active_count` drops to 0) while the parent session is
+still processing the wake turn (`pending_delivery_count > 0`). Poll until
+`drain_complete` is true before treating the session as fully drained.
 
 This does **not** change `run.completed` semantics: a run still completes when
 the parent turn ends. Typical orchestrator flow:
 
 1. Wait for `run.completed` on the original run
-2. Poll `GET /api/sessions/{session_id}/delegations` until `active_count == 0`
-3. Optionally read session messages / the wake turn for the child result
+2. Poll `GET /api/sessions/{session_id}/delegations` until `drain_complete == true`
+3. Read session messages for the consolidated child results
 
 ```bash
 # fork a session and run one turn
