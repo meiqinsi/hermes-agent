@@ -33,12 +33,15 @@ logger = logging.getLogger(__name__)
 
 # A wake self-post runs the entire agent turn synchronously (stream=false);
 # generous ceiling so long tool-using turns aren't killed mid-flight.
+#
+# IMPORTANT: a client-side TimeoutError here does NOT mean the server-side turn
+# stopped. Retrying the POST would start a *second* concurrent turn on the same
+# session (last-writer-wins corruption). Only retry errors where the request
+# likely never entered an agent turn (429 / connect failures).
 WAKE_TURN_TIMEOUT_SECONDS = 600.0
 
-# Backoff delays between retries on transient failures (429 concurrency cap,
-# connection errors). The API server has no per-session lock — concurrent
-# turns on one session are last-writer-wins — but it DOES enforce a global
-# max_concurrent_runs cap via HTTP 429, which is worth waiting out.
+# Backoff delays between retries on transient *pre-turn* failures (429
+# concurrency cap, connection errors). Do not use these for TimeoutError.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
@@ -167,7 +170,24 @@ async def _self_post_chat_completion(
                         attempt + 1,
                     )
                     return
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        except asyncio.TimeoutError as exc:
+            # The server-side turn is very likely still running. Retrying would
+            # open a concurrent turn on the same session — fail closed instead.
+            logger.error(
+                "wake self-post timed out for session %s after %.0fs "
+                "(attempt %d/%d); not retrying to avoid a concurrent turn: %s",
+                session_id,
+                WAKE_TURN_TIMEOUT_SECONDS,
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            raise RuntimeError(
+                f"wake self-post timed out for session {session_id} after "
+                f"{WAKE_TURN_TIMEOUT_SECONDS:.0f}s; not retrying because the "
+                f"server-side turn may still be running"
+            ) from exc
+        except (aiohttp.ClientError, OSError) as exc:
             last_err = exc
             logger.warning(
                 "wake self-post transient failure for session %s "

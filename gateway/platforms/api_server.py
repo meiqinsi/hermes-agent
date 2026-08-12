@@ -45,7 +45,7 @@ import hashlib
 import hmac
 import itertools
 import json
-from contextlib import contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 import logging
@@ -1454,6 +1454,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # (the /v1/runs path tracks its own in-flight set via
         # _active_run_tasks).
         self._inflight_agent_runs: int = 0
+        # Per raw session_id mutex for _run_agent turns. Without this, a wake
+        # self-post timeout retry (or overlapping chat POSTs) can run two
+        # conversation loops against the same SessionDB transcript
+        # (last-writer-wins). Ephemeral fingerprint sessions without an
+        # explicit X-Hermes-Session-Id still serialize when they share the
+        # derived id; empty ids skip the lock.
+        self._session_turn_locks: Dict[str, asyncio.Lock] = {}
+        self._session_turn_locks_guard = asyncio.Lock()
         # Every agent currently inside _run_agent(), i.e. exactly the turns
         # counted by _inflight_agent_runs above.  Shutdown needs the whole
         # adapter-owned set, so this is deliberately NOT _active_run_agents:
@@ -6092,6 +6100,34 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    async def _get_session_turn_lock(self, session_id: str) -> asyncio.Lock:
+        """Return the asyncio.Lock that serializes turns for ``session_id``."""
+        async with self._session_turn_locks_guard:
+            lock = self._session_turn_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_turn_locks[session_id] = lock
+            return lock
+
+    @asynccontextmanager
+    async def _hold_session_turn_lock(self, session_id: Optional[str]):
+        """Serialize ``_run_agent`` turns that share a non-empty session id.
+
+        Concurrent POSTs (including wake self-post retries) previously raced
+        on the same SessionDB transcript. Waiting on this lock queues the
+        second turn behind the first instead of interleaving tool loops.
+        """
+        sid = (session_id or "").strip()
+        if not sid:
+            yield
+            return
+        lock = await self._get_session_turn_lock(sid)
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+
     @staticmethod
     def _bind_api_server_session(
         *,
@@ -6355,12 +6391,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                     clear_session_vars(tokens)
 
-        self._activate_admitted_request()
-        self._inflight_agent_runs += 1
-        try:
-            return await loop.run_in_executor(None, _run)
-        finally:
-            self._inflight_agent_runs -= 1
+        # Wait for any in-flight turn on this session first, while the admit
+        # decorator's pending reservation still covers drain accounting.
+        async with self._hold_session_turn_lock(session_id):
+            self._activate_admitted_request()
+            self._inflight_agent_runs += 1
+            try:
+                return await loop.run_in_executor(None, _run)
+            finally:
+                self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

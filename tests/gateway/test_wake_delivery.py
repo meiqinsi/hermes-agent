@@ -125,3 +125,101 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_deliver_wake_timeout_does_not_retry(monkeypatch):
+    """Client timeout must not open a second concurrent turn on the session.
+
+    A TimeoutError means the server-side turn is likely still running. Retrying
+    the self-post would race two conversation loops on the same SessionDB
+    transcript (last-writer-wins).
+    """
+    from aiohttp import web
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "WAKE_TURN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01))
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        await asyncio.sleep(1.0)
+        return web.json_response({"choices": []})
+
+    async def run():
+        runner, port = await _serve(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            with pytest.raises(RuntimeError, match="timed out"):
+                await deliver_wake(adapter, text="x", session_id="sid")
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert calls["n"] == 1
+
+
+def test_session_turn_lock_serializes_same_session():
+    """Two _run_agent calls for the same session_id must not overlap."""
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter.__new__(APIServerAdapter)
+    adapter._session_turn_locks = {}
+    adapter._session_turn_locks_guard = asyncio.Lock()
+
+    active = {"n": 0}
+    max_active = {"n": 0}
+    order = []
+
+    async def hold(label: str, delay: float):
+        async with adapter._hold_session_turn_lock("sess-1"):
+            active["n"] += 1
+            max_active["n"] = max(max_active["n"], active["n"])
+            order.append(f"{label}:start")
+            await asyncio.sleep(delay)
+            order.append(f"{label}:end")
+            active["n"] -= 1
+
+    async def run():
+        await asyncio.gather(hold("a", 0.05), hold("b", 0.01))
+
+    asyncio.run(run())
+    assert max_active["n"] == 1
+    assert order == ["a:start", "a:end", "b:start", "b:end"] or order == [
+        "b:start",
+        "b:end",
+        "a:start",
+        "a:end",
+    ]
+
+
+def test_session_turn_lock_allows_different_sessions_in_parallel():
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter.__new__(APIServerAdapter)
+    adapter._session_turn_locks = {}
+    adapter._session_turn_locks_guard = asyncio.Lock()
+
+    active = {"n": 0}
+    max_active = {"n": 0}
+    gate = asyncio.Event()
+
+    async def hold(session_id: str):
+        async with adapter._hold_session_turn_lock(session_id):
+            active["n"] += 1
+            max_active["n"] = max(max_active["n"], active["n"])
+            await gate.wait()
+            active["n"] -= 1
+
+    async def run():
+        t1 = asyncio.create_task(hold("sess-a"))
+        t2 = asyncio.create_task(hold("sess-b"))
+        for _ in range(50):
+            if max_active["n"] >= 2:
+                break
+            await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.gather(t1, t2)
+
+    asyncio.run(run())
+    assert max_active["n"] == 2
+
