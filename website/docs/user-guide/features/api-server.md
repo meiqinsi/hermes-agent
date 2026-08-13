@@ -487,6 +487,7 @@ curl http://localhost:8642/api/sessions/$ID/delegations \
   "active_count": 1,
   "pending_delivery_count": 0,
   "drain_complete": false,
+  "session_busy": false,
   "delegations": [
     {
       "delegation_id": "deleg_...",
@@ -512,18 +513,24 @@ included.
 | `active_count` | Live subagent/batch units still running in the registry |
 | `pending_delivery_count` | Terminal delegations whose wake completion is not yet `delivered` |
 | `drain_complete` | `active_count == 0` and `pending_delivery_count == 0` |
+| `session_busy` | Parent session has an in-flight API-server agent turn (`/v1/runs`, chat/completions, session chat, or wake self-post) |
 | `delivery_state` | Per delegation: `pending`, `delivered`, or `dropped` (when included) |
 | `delivered_at` | Timestamp when wake injection completed (when `delivered`) |
 
 A subagent can finish (`active_count` drops to 0) while the parent session is
 still processing the wake turn (`pending_delivery_count > 0`). Poll until
-`drain_complete` is true before treating the session as fully drained.
+`drain_complete` is true before treating delegation delivery as drained.
+
+`drain_complete` does **not** mean the parent session is idle: a wake turn,
+follow-up chat, or `/v1/runs` job can still be running (`session_busy: true`),
+or background skill-review can overlap. Orchestrators that finalize a portal
+job should wait until **`drain_complete == true` and `session_busy == false`**.
 
 This does **not** change `run.completed` semantics: a run still completes when
 the parent turn ends. Typical orchestrator flow:
 
 1. Wait for `run.completed` on the original run
-2. Poll `GET /api/sessions/{session_id}/delegations` until `drain_complete == true`
+2. Poll `GET /api/sessions/{session_id}/delegations` until `drain_complete == true` **and** `session_busy == false`
 3. Read session messages for the consolidated child results
 
 ```bash

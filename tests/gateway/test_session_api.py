@@ -780,6 +780,7 @@ async def test_session_delegations_lists_active_for_origin_session(
         assert payload["active_count"] == 1
         assert payload["pending_delivery_count"] == 0
         assert payload["drain_complete"] is False
+        assert payload["session_busy"] is False
         assert len(payload["delegations"]) == 1
         row = payload["delegations"][0]
         assert row["delegation_id"] == res["delegation_id"]
@@ -853,6 +854,7 @@ async def test_session_delegations_pending_delivery_blocks_drain_complete(
     assert payload["active_count"] == 0
     assert payload["pending_delivery_count"] == 1
     assert payload["drain_complete"] is False
+    assert payload["session_busy"] is False
     assert recent_payload["active_count"] == 0
     assert recent_payload["pending_delivery_count"] == 1
     row = next(
@@ -875,12 +877,44 @@ async def test_session_delegations_pending_delivery_blocks_drain_complete(
 
     assert done_payload["pending_delivery_count"] == 0
     assert done_payload["drain_complete"] is True
+    assert done_payload["session_busy"] is False
     delivered_row = next(
         d for d in done_recent_payload["delegations"]
         if d["delegation_id"] == res["delegation_id"]
     )
     assert delivered_row["delivery_state"] == "delivered"
     assert isinstance(delivered_row["delivered_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_session_delegations_session_busy_while_parent_turn_held(
+    adapter, session_db,
+):
+    """session_busy tracks in-flight parent turns, orthogonal to drain_complete."""
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    session_id = session_db.create_session("deleg-busy-session", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        idle = await cli.get(f"/api/sessions/{session_id}/delegations")
+        idle_payload = await idle.json()
+        assert idle_payload["session_busy"] is False
+        assert idle_payload["drain_complete"] is True
+
+        async with adapter._hold_session_parent_turn(session_id):
+            busy = await cli.get(f"/api/sessions/{session_id}/delegations")
+            busy_payload = await busy.json()
+            assert busy_payload["session_busy"] is True
+            # No delegations — drain can be complete while parent is still busy.
+            assert busy_payload["drain_complete"] is True
+            assert busy_payload["active_count"] == 0
+            assert busy_payload["pending_delivery_count"] == 0
+
+        after = await cli.get(f"/api/sessions/{session_id}/delegations")
+        after_payload = await after.json()
+        assert after_payload["session_busy"] is False
 
 
 @pytest.mark.asyncio
@@ -899,4 +933,5 @@ async def test_session_delegations_requires_auth(auth_adapter, session_db):
         assert payload["active_count"] == 0
         assert payload["pending_delivery_count"] == 0
         assert payload["drain_complete"] is True
+        assert payload["session_busy"] is False
         assert payload["delegations"] == []
