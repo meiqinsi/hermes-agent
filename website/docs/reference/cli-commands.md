@@ -58,6 +58,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes status` | Show agent, auth, and platform status. |
 | `hermes cron` | Inspect and tick the cron scheduler. |
 | `hermes kanban` | Multi-profile collaboration board (tasks, links, dispatcher). |
+| `hermes handoffs` | Read-only lifecycle view of durable async delegations and gateway final-response deliveries. |
 | `hermes project` | Manage named, multi-folder workspaces (projects). Anchors desktop session grouping and, when bound to a kanban board, gives tasks a deterministic worktree + branch convention. State is per-profile. |
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
 | `hermes hooks` | Inspect, approve, or remove shell-script hooks declared in `config.yaml`. |
@@ -712,6 +713,30 @@ tail -f ~/.hermes/proxy/iron-proxy.log | jq  # daemon + per-request log (line-de
 ```
 
 Common failure modes + recovery are covered in [Egress proxy → Troubleshooting](../user-guide/egress/iron-proxy.md#troubleshooting).
+
+## `hermes handoffs`
+
+Inspect existing durable handoff carriers without changing their state:
+
+```bash
+hermes handoffs list [--all-profiles] [--state actionable] [--json]
+hermes handoffs show <delegation|delivery>:<id> [--json]
+```
+
+The view preserves each carrier's native producer and delivery states. The
+`actionable` filter hides only confirmed delivered rows, so failed, dropped,
+abandoned, and unknown work remains visible for inspection. `--all-profiles`
+opens every discovered profile's `state.db` in SQLite read-only mode; missing,
+legacy, or corrupt stores produce warnings without hiding healthy profiles.
+Read-only here means Hermes never changes database content or schema. SQLite
+may still maintain its `-wal`/`-shm` coordination sidecars while reading a WAL
+database. If filesystem permissions prevent that coordination, the affected
+store is reported as unavailable instead of appearing empty or successful.
+
+Output is metadata-only. It never reads or prints delegation prompts, goals,
+context, results, final-response content, credentials, raw chat/user IDs, or
+full destination addresses. JSON output uses the same safe projection as the
+human-readable view.
 
 ## `hermes project`
 

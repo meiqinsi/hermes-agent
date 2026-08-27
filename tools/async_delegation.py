@@ -1613,6 +1613,68 @@ def list_durable_delegations_for_session(session_id: str) -> List[Dict[str, Any]
     return out
 
 
+def list_durable_delegations_readonly(db_path) -> List[Dict[str, Any]]:
+    """Return safe lifecycle metadata from an existing state DB, read-only.
+
+    The attended CLI projection must never initialize/migrate a store or read
+    task/event/result payload text.  Runtime delivery helpers keep using the
+    normal profile-local transaction path above.
+    """
+    from pathlib import Path
+
+    path = Path(db_path).resolve()
+    uri = path.as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=2)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(async_delegations)")
+        }
+        if "delegation_id" not in columns:
+            raise sqlite3.OperationalError("async_delegations has no delegation_id")
+
+        def col(name: str, fallback: str = "NULL") -> str:
+            return f'"{name}"' if name in columns else fallback
+
+        payload_expr = (
+            f"CASE WHEN {col('event_json')} IS NOT NULL OR "
+            f"{col('result_json')} IS NOT NULL THEN 1 ELSE 0 END"
+        )
+        order_col = col("updated_at", col("dispatched_at"))
+        rows = conn.execute(
+            f"""SELECT delegation_id, {col('state')}, {col('delivery_state')},
+                       {col('dispatched_at')}, {col('updated_at')},
+                       {col('completed_at')}, {col('delivery_attempts', '0')},
+                       {col('parent_session_id')}, {col('origin_session_id')},
+                       {col('origin_session')}, {payload_expr}
+                FROM async_delegations
+                ORDER BY {order_col} DESC,
+                         delegation_id ASC"""
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "delegation_id": row[0],
+            "producer_state": row[1],
+            "delivery_state": row[2],
+            "dispatched_at": row[3],
+            "updated_at": row[4],
+            "completed_at": row[5],
+            "delivery_attempts": row[6],
+            "parent_session_id": row[7],
+            "origin_session_id": row[8],
+            "session_key": row[9],
+            "payload_available": bool(row[10]),
+            "_schema_incomplete": any(
+                name not in columns
+                for name in ("state", "delivery_state", "updated_at")
+            ),
+        }
+        for row in rows
+    ]
+
+
 def snapshot_session_delegations(
     session_id: str,
     *,
