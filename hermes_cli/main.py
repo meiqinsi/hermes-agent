@@ -4885,6 +4885,13 @@ def cmd_project(args):
     return projects_command(args)
 
 
+def cmd_handoffs(args):
+    """Inspect durable handoff activity without mutating carrier state."""
+    from hermes_cli.handoffs_cmd import handoffs_command
+
+    return handoffs_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -11777,6 +11784,14 @@ def main():
 
     project_parser = _build_project_parser(subparsers)
     project_parser.set_defaults(func=cmd_project)
+
+    # =========================================================================
+    # handoffs command — read-only durable activity projection
+    # =========================================================================
+    from hermes_cli.handoffs_cmd import build_parser as _build_handoffs_parser
+
+    handoffs_parser = _build_handoffs_parser(subparsers)
+    handoffs_parser.set_defaults(func=cmd_handoffs)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management

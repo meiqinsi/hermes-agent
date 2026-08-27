@@ -372,3 +372,53 @@ def debug_rows(limit: int = 20) -> str:
         ],
         indent=2,
     )
+
+
+def list_delivery_obligations_readonly(db_path) -> List[Dict[str, Any]]:
+    """Return lifecycle metadata without reading stored response content."""
+    from pathlib import Path
+
+    path = Path(db_path).resolve()
+    uri = path.as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=2)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+        }
+        if "obligation_id" not in columns:
+            raise sqlite3.OperationalError("delivery_obligations has no obligation_id")
+
+        def col(name: str, fallback: str = "NULL") -> str:
+            return f'"{name}"' if name in columns else fallback
+
+        order_col = col("updated_at", col("created_at"))
+        rows = conn.execute(
+            f"""SELECT obligation_id, {col('state')}, {col('attempts', '0')},
+                       {col('created_at')}, {col('updated_at')},
+                       {col('session_key')}, {col('platform')},
+                       {col('adapter_profile')},
+                       CASE WHEN {col('content')} IS NOT NULL THEN 1 ELSE 0 END
+                FROM delivery_obligations
+                ORDER BY {order_col} DESC,
+                         obligation_id ASC"""
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "obligation_id": row[0],
+            "delivery_state": row[1],
+            "attempts": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+            "session_key": row[5],
+            "platform": row[6],
+            "adapter_profile": row[7],
+            "payload_available": bool(row[8]),
+            "_schema_incomplete": any(
+                name not in columns for name in ("state", "updated_at")
+            ),
+        }
+        for row in rows
+    ]
